@@ -1,0 +1,1 @@
+savedcmd_/home/ubuntu/OS2/rootkit_hidden_process.ko := ld -r -m elf_x86_64 -z noexecstack --build-id=sha1  -T scripts/module.lds -o /home/ubuntu/OS2/rootkit_hidden_process.ko /home/ubuntu/OS2/rootkit_hidden_process.o /home/ubuntu/OS2/rootkit_hidden_process.mod.o

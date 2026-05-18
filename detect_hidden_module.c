@@ -13,7 +13,7 @@
  * 发现被隐藏的内核模块。
  * 
  * 编译：gcc -o detect_hidden_module detect_hidden_module.c
- * 运行：sudo ./detect_hidden_module
+ * 运行：./detect_hidden_module
  */
 
 #include <stdio.h>
@@ -21,9 +21,20 @@
 #include <string.h>
 #include <dirent.h>
 #include <ctype.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #define MAX_MODULES 512
 #define MAX_NAME_LEN 256
+
+/* 过滤内建模块：仅统计可加载模块（/sys/module/<name>/sections 存在） */
+static int is_loadable_module(const char *name)
+{
+    char path[512];
+
+    snprintf(path, sizeof(path), "/sys/module/%s/sections", name);
+    return access(path, F_OK) == 0;
+}
 
 /* 从 /proc/modules 读取可见模块列表 */
 int read_proc_modules(char modules[][MAX_NAME_LEN], int max_count)
@@ -68,13 +79,18 @@ int read_sys_modules(char modules[][MAX_NAME_LEN], int max_count)
     }
 
     while ((entry = readdir(dir)) != NULL && count < max_count) {
+        struct stat st;
+        char path[512];
+
         /* 跳过 . 和 .. 目录 */
-        if (strcmp(entry->d_name, ".") == 0 || 
+        if (strcmp(entry->d_name, ".") == 0 ||
             strcmp(entry->d_name, "..") == 0)
             continue;
 
-        /* 只关注目录项 */
-        if (entry->d_type == DT_DIR || entry->d_type == DT_LNK) {
+        /* 仅统计目录或符号链接指向的目录 */
+        snprintf(path, sizeof(path), "/sys/module/%s", entry->d_name);
+        if (stat(path, &st) == 0 && S_ISDIR(st.st_mode) &&
+            is_loadable_module(entry->d_name)) {
             strncpy(modules[count], entry->d_name, MAX_NAME_LEN - 1);
             modules[count][MAX_NAME_LEN - 1] = '\0';
             count++;

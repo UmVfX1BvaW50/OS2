@@ -26,6 +26,7 @@
 #include <string.h>
 #include <dirent.h>
 #include <ctype.h>
+#include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -42,6 +43,34 @@ typedef struct {
 /* 位图标记PID是否可见 */
 static char visible_pids[MAX_PID];
 static char accessible_pids[MAX_PID];
+
+/* 仅统计当前用户可见的进程，避免 /proc 目录隐藏策略造成误报 */
+static int is_pid_owned_by_euid(int pid)
+{
+    char path[64];
+    char line[256];
+    FILE *fp;
+    uid_t euid = geteuid();
+
+    snprintf(path, sizeof(path), "/proc/%d/status", pid);
+    fp = fopen(path, "r");
+    if (!fp)
+        return 0;
+
+    while (fgets(line, sizeof(line), fp)) {
+        if (strncmp(line, "Uid:", 4) == 0) {
+            unsigned int uid = 0;
+            if (sscanf(line, "Uid:\t%u", &uid) == 1) {
+                fclose(fp);
+                return uid == (unsigned int)euid;
+            }
+            break;
+        }
+    }
+
+    fclose(fp);
+    return 0;
+}
 
 /* 从 /proc 目录获取所有可见进程PID */
 int get_visible_pids(void)
@@ -69,8 +98,10 @@ int get_visible_pids(void)
         if (is_pid) {
             int pid = atoi(entry->d_name);
             if (pid > 0 && pid < MAX_PID) {
-                visible_pids[pid] = 1;
-                count++;
+                if (is_pid_owned_by_euid(pid)) {
+                    visible_pids[pid] = 1;
+                    count++;
+                }
             }
         }
     }
@@ -87,11 +118,15 @@ int scan_accessible_pids(void)
 
     for (int pid = 1; pid < MAX_PID; pid++) {
         snprintf(path, sizeof(path), "/proc/%d", pid);
-        
-        /* 尝试访问 /proc/<pid> 目录 */
-        if (access(path, F_OK) == 0) {
-            accessible_pids[pid] = 1;
-            count++;
+
+        /* 尝试打开 /proc/<pid> 目录，避免 hidepid 造成误报 */
+        DIR *proc_dir = opendir(path);
+        if (proc_dir) {
+            closedir(proc_dir);
+            if (is_pid_owned_by_euid(pid)) {
+                accessible_pids[pid] = 1;
+                count++;
+            }
         }
     }
 
@@ -180,6 +215,10 @@ int main(void)
     printf("[*] Step 2: Brute-force scanning /proc/<pid>/...\n");
     accessible_count = scan_accessible_pids();
     printf("    Accessible PIDs: %d\n\n", accessible_count);
+
+    if (geteuid() != 0 && accessible_count > visible_count) {
+        printf("[!] Warning: /proc listing may be filtered. Run as root for accurate results.\n\n");
+    }
 
     /* 步骤3：交叉对比，发现隐藏进程 */
     printf("[*] Step 3: Cross-view comparison...\n\n");
