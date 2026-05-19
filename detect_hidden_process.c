@@ -30,6 +30,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <errno.h>
+#include <poll.h>
+#include <time.h>
 
 #define MAX_PID 32768  /* 默认最大PID值 */
 #define MAX_PROCS 65536
@@ -43,6 +46,9 @@ typedef struct {
 /* 位图标记PID是否可见 */
 static char visible_pids[MAX_PID];
 static char accessible_pids[MAX_PID];
+static char sched_pids[MAX_PID];
+static char allocated_pids[MAX_PID];
+static char reported_pids[MAX_PID];
 
 /* 仅统计当前用户可见的进程，避免 /proc 目录隐藏策略造成误报 */
 static int is_pid_owned_by_euid(int pid)
@@ -195,6 +201,160 @@ void get_process_status(int pid, char *status, int status_len)
     }
 }
 
+static int write_string(const char *path, const char *value)
+{
+    int fd = open(path, O_WRONLY);
+    if (fd < 0)
+        return -1;
+    fcntl(fd, F_SETFD, FD_CLOEXEC);
+    if (write(fd, value, strlen(value)) < 0) {
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    return 0;
+}
+
+static const char *find_tracefs_path(void)
+{
+    static const char *paths[] = {
+        "/sys/kernel/tracing",
+        "/sys/kernel/debug/tracing",
+    };
+
+    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+        if (access(paths[i], R_OK | W_OK) == 0)
+            return paths[i];
+    }
+
+    return NULL;
+}
+
+static int sample_sched_switch_pids(int seconds)
+{
+    char path[256];
+    const char *tracefs = find_tracefs_path();
+    int fd;
+    time_t end_time;
+
+    if (!tracefs) {
+        fprintf(stderr, "[!] tracefs not accessible (need root)\n");
+        return -1;
+    }
+
+    snprintf(path, sizeof(path), "%s/current_tracer", tracefs);
+    write_string(path, "nop");
+
+    snprintf(path, sizeof(path), "%s/events/sched/sched_switch/enable", tracefs);
+    if (write_string(path, "1") < 0) {
+        perror("enable sched_switch");
+        return -1;
+    }
+
+    snprintf(path, sizeof(path), "%s/tracing_on", tracefs);
+    write_string(path, "1");
+
+    snprintf(path, sizeof(path), "%s/trace_pipe", tracefs);
+    fd = open(path, O_RDONLY | O_NONBLOCK);
+    if (fd < 0) {
+        perror("open trace_pipe");
+        snprintf(path, sizeof(path), "%s/events/sched/sched_switch/enable", tracefs);
+        write_string(path, "0");
+        return -1;
+    }
+    fcntl(fd, F_SETFD, FD_CLOEXEC);
+
+    end_time = time(NULL) + seconds;
+    while (time(NULL) < end_time) {
+        struct pollfd pfd = { .fd = fd, .events = POLLIN };
+        int ret = poll(&pfd, 1, 200);
+        if (ret <= 0)
+            continue;
+        if (pfd.revents & POLLIN) {
+            char buf[4096];
+            ssize_t len = read(fd, buf, sizeof(buf) - 1);
+            if (len <= 0)
+                continue;
+            buf[len] = '\0';
+
+            char *line = buf;
+            while (line && *line) {
+                char *next_line = strchr(line, '\n');
+                if (next_line)
+                    *next_line = '\0';
+
+                if (strstr(line, "sched_switch")) {
+                    int prev_pid = -1;
+                    int next_pid = -1;
+                    char *prev = strstr(line, "prev_pid=");
+                    char *next = strstr(line, "next_pid=");
+                    if (prev)
+                        sscanf(prev, "prev_pid=%d", &prev_pid);
+                    if (next)
+                        sscanf(next, "next_pid=%d", &next_pid);
+
+                    if (prev_pid > 0 && prev_pid < MAX_PID)
+                        sched_pids[prev_pid] = 1;
+                    if (next_pid > 0 && next_pid < MAX_PID)
+                        sched_pids[next_pid] = 1;
+                }
+
+                if (!next_line)
+                    break;
+                line = next_line + 1;
+            }
+        }
+    }
+
+    close(fd);
+    snprintf(path, sizeof(path), "%s/events/sched/sched_switch/enable", tracefs);
+    write_string(path, "0");
+    return 0;
+}
+
+static int read_allocated_pids(void)
+{
+    FILE *fp;
+    int pid;
+    int count = 0;
+
+    fp = fopen("/proc/allocated_pids", "r");
+    if (!fp)
+        return -1;
+
+    while (fscanf(fp, "%d", &pid) == 1) {
+        if (pid > 0 && pid < MAX_PID) {
+            allocated_pids[pid] = 1;
+            count++;
+        }
+    }
+
+    fclose(fp);
+    return count;
+}
+
+static void report_hidden_pid(int pid, const char *tag)
+{
+    char name[256];
+    char status[256];
+
+    if (reported_pids[pid])
+        return;
+
+    get_process_name(pid, name, sizeof(name));
+    get_process_status(pid, status, sizeof(status));
+
+    if (tag)
+        printf("[!] HIDDEN PROCESS DETECTED (%s):\n", tag);
+    else
+        printf("[!] HIDDEN PROCESS DETECTED:\n");
+    printf("    PID:  %d\n", pid);
+    printf("    Name: %s\n", name);
+    printf("    %s\n\n", status);
+
+    reported_pids[pid] = 1;
+}
+
 int main(void)
 {
     int visible_count, accessible_count;
@@ -216,25 +376,47 @@ int main(void)
     accessible_count = scan_accessible_pids();
     printf("    Accessible PIDs: %d\n\n", accessible_count);
 
+    /* 步骤3：读取内核导出的PID分配表（需加载检测内核模块） */
+    printf("[*] Step 3: Reading allocated PID list from kernel...\n");
+    int allocated_count = read_allocated_pids();
+    if (allocated_count < 0) {
+        printf("    /proc/allocated_pids not available\n\n");
+    } else {
+        printf("    Allocated PIDs: %d\n\n", allocated_count);
+    }
+
+    /* 步骤4：通过 tracefs 采样调度事件，获取内核运行过的PID */
+    printf("[*] Step 4: Sampling sched_switch via tracefs (2s)...\n");
+    if (sample_sched_switch_pids(2) < 0) {
+        printf("    tracefs sampling failed (need root + tracefs)\n\n");
+    } else {
+        printf("    Sampling done.\n\n");
+    }
+
     if (geteuid() != 0 && accessible_count > visible_count) {
         printf("[!] Warning: /proc listing may be filtered. Run as root for accurate results.\n\n");
     }
 
-    /* 步骤3：交叉对比，发现隐藏进程 */
-    printf("[*] Step 3: Cross-view comparison...\n\n");
+    /* 步骤5：交叉对比，发现隐藏进程 */
+    printf("[*] Step 5: Cross-view comparison...\n\n");
 
     for (int pid = 1; pid < MAX_PID; pid++) {
         if (accessible_pids[pid] && !visible_pids[pid]) {
-            char name[256];
-            char status[256];
+            report_hidden_pid(pid, NULL);
+            hidden_count++;
+        }
+    }
 
-            get_process_name(pid, name, sizeof(name));
-            get_process_status(pid, status, sizeof(status));
+    for (int pid = 1; pid < MAX_PID; pid++) {
+        if (allocated_pids[pid] && !visible_pids[pid]) {
+            report_hidden_pid(pid, "pidmap");
+            hidden_count++;
+        }
+    }
 
-            printf("[!] HIDDEN PROCESS DETECTED:\n");
-            printf("    PID:  %d\n", pid);
-            printf("    Name: %s\n", name);
-            printf("    %s\n\n", status);
+    for (int pid = 1; pid < MAX_PID; pid++) {
+        if (sched_pids[pid] && !visible_pids[pid] && !accessible_pids[pid]) {
+            report_hidden_pid(pid, "sched_trace");
             hidden_count++;
         }
     }

@@ -1,5 +1,6 @@
 obj-m += rootkit_hidden_module.o
 obj-m += rootkit_hidden_process.o
+obj-m += detect_hidden_process_kmod.o
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)

