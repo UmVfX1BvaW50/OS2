@@ -1,0 +1,3 @@
+/home/ubuntu/OS2/rootkit_hidden_module.ko
+/home/ubuntu/OS2/rootkit_hidden_process.ko
+/home/ubuntu/OS2/detect_hidden_process_kmod.ko

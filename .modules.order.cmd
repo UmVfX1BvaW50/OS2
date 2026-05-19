@@ -1,0 +1,1 @@
+cmd_/home/ubuntu/OS2/modules.order := {   echo /home/ubuntu/OS2/rootkit_hidden_module.ko;   echo /home/ubuntu/OS2/rootkit_hidden_process.ko;   echo /home/ubuntu/OS2/detect_hidden_process_kmod.ko; :; } | awk '!x[$$0]++' - > /home/ubuntu/OS2/modules.order

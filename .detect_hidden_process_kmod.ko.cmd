@@ -1,0 +1,1 @@
+cmd_/home/ubuntu/OS2/detect_hidden_process_kmod.ko := ld -r -m elf_x86_64 -z noexecstack --build-id=sha1  -T scripts/module.lds -o /home/ubuntu/OS2/detect_hidden_process_kmod.ko /home/ubuntu/OS2/detect_hidden_process_kmod.o /home/ubuntu/OS2/detect_hidden_process_kmod.mod.o;  true
